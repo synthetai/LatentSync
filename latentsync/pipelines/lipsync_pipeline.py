@@ -255,61 +255,106 @@ class LipsyncPipeline(DiffusionPipeline):
         faces = []
         boxes = []
         affine_matrices = []
-        print(f"Affine transforming {len(video_frames)} faces...")
-        for frame in tqdm.tqdm(video_frames):
-            face, box, affine_matrix = self.image_processor.affine_transform(frame)
-            faces.append(face)
-            boxes.append(box)
-            affine_matrices.append(affine_matrix)
+        face_mask = []  # 记录哪些帧有人脸
+        device = self._execution_device
+        
+        print(f"Affine transforming {len(video_frames)} frames...")
+        for i, frame in enumerate(tqdm.tqdm(video_frames)):
+            face, box, affine_matrix = self.image_processor.affine_transform(frame, allow_no_face=True)
+            
+            if face is not None:
+                # 有人脸的帧，确保face tensor在正确的设备上
+                if face.device != device:
+                    face = face.to(device)
+                faces.append(face)
+                boxes.append(box)
+                affine_matrices.append(affine_matrix)
+                face_mask.append(True)
+                print(f"Frame {i+1}: Face detected")
+            else:
+                # 无人脸的帧，创建一个占位符
+                # 使用原始帧作为face，但会在后续处理中跳过
+                placeholder_face = self.create_placeholder_face(frame)
+                # 确保placeholder也在正确的设备上
+                placeholder_face = placeholder_face.to(device)
+                faces.append(placeholder_face)
+                boxes.append(None)
+                affine_matrices.append(None)
+                face_mask.append(False)
+                print(f"Frame {i+1}: No face detected, will use original frame")
 
         faces = torch.stack(faces)
-        return faces, boxes, affine_matrices
+        return faces, boxes, affine_matrices, face_mask
+    
+    def create_placeholder_face(self, frame):
+        """为无人脸的帧创建占位符"""
+        # 将原始帧resize到目标分辨率作为占位符
+        h, w = frame.shape[:2]
+        target_size = self.image_processor.resolution
+        
+        # 简单resize
+        placeholder = cv2.resize(frame, (target_size, target_size), interpolation=cv2.INTER_LANCZOS4)
+        placeholder = rearrange(torch.from_numpy(placeholder), "h w c -> c h w")
+        # 确保placeholder与其他tensor具有相同的数据类型
+        placeholder = placeholder.float()
+        return placeholder
 
-    def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list):
+    def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list, face_mask: list):
         video_frames = video_frames[: len(faces)]
         out_frames = []
-        print(f"Restoring {len(faces)} faces...")
+        print(f"Restoring {len(faces)} frames...")
         for index, face in enumerate(tqdm.tqdm(faces)):
-            x1, y1, x2, y2 = boxes[index]
-            height = int(y2 - y1)
-            width = int(x2 - x1)
-            face = torchvision.transforms.functional.resize(
-                face, size=(height, width), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True
-            )
-            out_frame = self.image_processor.restorer.restore_img(video_frames[index], face, affine_matrices[index])
-            out_frames.append(out_frame)
+            if face_mask[index]:
+                # 有人脸的帧，进行正常的恢复处理
+                x1, y1, x2, y2 = boxes[index]
+                height = int(y2 - y1)
+                width = int(x2 - x1)
+                face = torchvision.transforms.functional.resize(
+                    face, size=(height, width), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True
+                )
+                out_frame = self.image_processor.restorer.restore_img(video_frames[index], face, affine_matrices[index])
+                out_frames.append(out_frame)
+                print(f"Frame {index+1}: Restored with lip-sync")
+            else:
+                # 无人脸的帧，直接使用原始帧
+                out_frames.append(video_frames[index])
+                print(f"Frame {index+1}: Using original frame (no face)")
         return np.stack(out_frames, axis=0)
 
     def loop_video(self, whisper_chunks: list, video_frames: np.ndarray):
         # If the audio is longer than the video, we need to loop the video
         if len(whisper_chunks) > len(video_frames):
-            faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
+            faces, boxes, affine_matrices, face_mask = self.affine_transform_video(video_frames)
             num_loops = math.ceil(len(whisper_chunks) / len(video_frames))
             loop_video_frames = []
             loop_faces = []
             loop_boxes = []
             loop_affine_matrices = []
+            loop_face_mask = []
             for i in range(num_loops):
                 if i % 2 == 0:
                     loop_video_frames.append(video_frames)
                     loop_faces.append(faces)
                     loop_boxes += boxes
                     loop_affine_matrices += affine_matrices
+                    loop_face_mask += face_mask
                 else:
                     loop_video_frames.append(video_frames[::-1])
                     loop_faces.append(faces.flip(0))
                     loop_boxes += boxes[::-1]
                     loop_affine_matrices += affine_matrices[::-1]
+                    loop_face_mask += face_mask[::-1]
 
             video_frames = np.concatenate(loop_video_frames, axis=0)[: len(whisper_chunks)]
             faces = torch.cat(loop_faces, dim=0)[: len(whisper_chunks)]
             boxes = loop_boxes[: len(whisper_chunks)]
             affine_matrices = loop_affine_matrices[: len(whisper_chunks)]
+            face_mask = loop_face_mask[: len(whisper_chunks)]
         else:
             video_frames = video_frames[: len(whisper_chunks)]
-            faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
+            faces, boxes, affine_matrices, face_mask = self.affine_transform_video(video_frames)
 
-        return video_frames, faces, boxes, affine_matrices
+        return video_frames, faces, boxes, affine_matrices, face_mask
 
     @torch.no_grad()
     def __call__(
@@ -342,7 +387,29 @@ class LipsyncPipeline(DiffusionPipeline):
         batch_size = 1
         device = self._execution_device
         mask_image = load_fixed_mask(height, mask_image_path)
-        self.image_processor = ImageProcessor(height, device="cuda", mask_image=mask_image)
+        # 确保mask_image在正确的设备上
+        mask_image = mask_image.to(device)
+        
+        # Configure face detection parameters
+        try:
+            import sys
+            import os
+            sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+            from face_detection_config import get_face_detection_config
+            face_detector_config = get_face_detection_config()
+        except ImportError:
+            # 如果导入失败，使用默认的宽松配置
+            print("Warning: Could not load face_detection_config.py, using default lenient config")
+            face_detector_config = {
+                'min_face_size': 30,
+                'min_face_height': 50,
+                'aspect_ratio_range': (0.1, 3.0),
+                'detection_threshold': 0.3,
+                'debug': True
+            }
+        
+        self.image_processor = ImageProcessor(height, device="cuda", mask_image=mask_image, 
+                                            face_detector_config=face_detector_config)
         self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
 
         # 1. Default height and width to unet
@@ -370,7 +437,18 @@ class LipsyncPipeline(DiffusionPipeline):
         audio_samples = read_audio(audio_path)
         video_frames = read_video(video_path, use_decord=False)
 
-        video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
+        video_frames, faces, boxes, affine_matrices, face_mask = self.loop_video(whisper_chunks, video_frames)
+
+        # 统计人脸检测情况
+        total_frames = len(face_mask)
+        frames_with_faces = sum(face_mask)
+        frames_without_faces = total_frames - frames_with_faces
+        
+        print(f"\n📊 Face Detection Statistics:")
+        print(f"Total frames: {total_frames}")
+        print(f"Frames with faces: {frames_with_faces} ({frames_with_faces/total_frames*100:.1f}%)")
+        print(f"Frames without faces: {frames_without_faces} ({frames_without_faces/total_frames*100:.1f}%)")
+        print(f"Strategy: Lip-sync for frames with faces, keep original for frames without faces\n")
 
         synced_video_frames = []
 
@@ -390,16 +468,34 @@ class LipsyncPipeline(DiffusionPipeline):
 
         num_inferences = math.ceil(len(whisper_chunks) / num_frames)
         for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
+            # 获取当前批次的帧索引和人脸掩码
+            start_idx = i * num_frames
+            end_idx = (i + 1) * num_frames
+            batch_face_mask = face_mask[start_idx:end_idx]
+            
+            # 检查当前批次是否有人脸
+            has_faces_in_batch = any(batch_face_mask)
+            
+            if not has_faces_in_batch:
+                # 如果当前批次没有人脸，跳过推理，直接使用原始帧
+                print(f"Batch {i+1}: No faces detected, using original frames")
+                inference_faces = faces[start_idx:end_idx]
+                # 直接将原始帧转换为所需格式，确保在正确的设备上
+                original_frames = self.image_processor.process_images(inference_faces, device=device)
+                original_frames = original_frames.to(device=device, dtype=weight_dtype)
+                synced_video_frames.append(original_frames)
+                continue
+                
             if self.unet.add_audio_layer:
-                audio_embeds = torch.stack(whisper_chunks[i * num_frames : (i + 1) * num_frames])
+                audio_embeds = torch.stack(whisper_chunks[start_idx:end_idx])
                 audio_embeds = audio_embeds.to(device, dtype=weight_dtype)
                 if do_classifier_free_guidance:
                     null_audio_embeds = torch.zeros_like(audio_embeds)
                     audio_embeds = torch.cat([null_audio_embeds, audio_embeds])
             else:
                 audio_embeds = None
-            inference_faces = faces[i * num_frames : (i + 1) * num_frames]
-            latents = all_latents[:, :, i * num_frames : (i + 1) * num_frames]
+            inference_faces = faces[start_idx:end_idx]
+            latents = all_latents[:, :, start_idx:end_idx]
             ref_pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
                 inference_faces, affine_transform=False
             )
@@ -465,7 +561,23 @@ class LipsyncPipeline(DiffusionPipeline):
             )
             synced_video_frames.append(decoded_latents)
 
-        synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices)
+        # 确保所有tensor在同一设备上再进行拼接
+        device = self._execution_device
+        synced_video_frames_on_device = []
+        for frames in synced_video_frames:
+            # 确保设备一致
+            if frames.device != device:
+                frames = frames.to(device)
+            # 确保数据类型一致
+            if frames.dtype != weight_dtype:
+                frames = frames.to(dtype=weight_dtype)
+            synced_video_frames_on_device.append(frames)
+        
+        print(f"Concatenating {len(synced_video_frames_on_device)} frame batches...")
+        concatenated_frames = torch.cat(synced_video_frames_on_device)
+        print(f"Final tensor shape: {concatenated_frames.shape}, device: {concatenated_frames.device}, dtype: {concatenated_frames.dtype}")
+        
+        synced_video_frames = self.restore_video(concatenated_frames, video_frames, boxes, affine_matrices, face_mask)
 
         audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
         audio_samples = audio_samples[:audio_samples_remain_length].cpu().numpy()
